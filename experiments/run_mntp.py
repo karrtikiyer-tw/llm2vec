@@ -17,6 +17,7 @@
 The script is adapted from https://github.com/huggingface/transformers/blob/51bcadc10a569847b93a30dbe3a077037ae63bad/examples/pytorch/language-modeling/run_mlm.py
 """
 
+import glob
 import logging
 import math
 import os
@@ -56,6 +57,7 @@ from llm2vec.models import (
     MistralBiForMNTP,
     LlamaBiForMNTP,
     GemmaBiForMNTP,
+    Gemma2BiForMNTP,
     Qwen2BiForMNTP,
 )
 
@@ -80,6 +82,8 @@ def get_model_class(config):
         return LlamaBiForMNTP
     elif config_class_name == "GemmaConfig":
         return GemmaBiForMNTP
+    elif config_class_name == "Gemma2Config":  
+        return Gemma2BiForMNTP
     elif config_class_name == "Qwen2Config":
         return Qwen2BiForMNTP
     else:
@@ -97,6 +101,7 @@ def initialize_peft(
         "LlamaConfig",
         "MistralConfig",
         "GemmaConfig",
+        "Gemma2Config",
         "Qwen2Config",
     ]:
         lora_modules = [
@@ -351,13 +356,13 @@ class DataTrainingArguments:
         else:
             if self.train_file is not None:
                 extension = self.train_file.split(".")[-1]
-                if extension not in ["csv", "json", "txt"]:
+                if extension not in ["csv", "json", "txt", "parquet"]:
                     raise ValueError(
                         "`train_file` should be a csv, a json or a txt file."
                     )
             if self.validation_file is not None:
                 extension = self.validation_file.split(".")[-1]
-                if extension not in ["csv", "json", "txt"]:
+                if extension not in ["csv", "json", "txt", "parquet"]:
                     raise ValueError(
                         "`validation_file` should be a csv, a json or a txt file."
                     )
@@ -442,6 +447,13 @@ class MNTPTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.label_names = ["labels"]
 
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # Force use_cache=False to avoid HybridCache DataParallel issues
+        inputs = {k: v for k, v in inputs.items()}  # Copy inputs
+        inputs["use_cache"] = False
+        # Let parent handle the rest
+        return super().compute_loss(model, inputs, return_outputs)
+
     def _remove_unused_columns(
         self, dataset: "datasets.Dataset", description: Optional[str] = None
     ):
@@ -457,6 +469,13 @@ class MNTPTrainer(Trainer):
         # model organization is MODEL_TYPEBiForMNTP.model -> MODEL_TYPELBiModel, we have to save the inner model, handled by save_peft_model function of the outer model
         self.model.save_peft_model(output_dir)
         self.tokenizer.save_pretrained(output_dir)
+
+        # ✅ Verify configs are equivalent (can remove after testing)
+        assert self.model.config.__class__.__name__ == self.model.model.config.__class__.__name__, \
+        f"Config mismatch: {self.model.config.__class__.__name__} vs {self.model.model.config.__class__.__name__}"
+    
+        # Save the PEFT model's config (more explicit)
+        self.model.model.config.save_pretrained(output_dir)
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
@@ -561,6 +580,7 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
+    local_parquet_dir = "/workspace/mounted/llm2vec/th/"
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
@@ -570,6 +590,7 @@ def main():
             token=model_args.token,
             streaming=data_args.streaming,
         )
+        
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 data_args.dataset_name,
@@ -587,6 +608,33 @@ def main():
                 token=model_args.token,
                 streaming=data_args.streaming,
             )
+    elif local_parquet_dir is not None:
+        # Load from local parquet files
+        parquet_files = glob.glob(os.path.join(local_parquet_dir, "*.parquet"))
+        
+        if not parquet_files:
+            raise FileNotFoundError(f"No parquet files found in {data_args.local_parquet_dir}")
+        
+        # Load all parquet files as training data
+        raw_datasets = load_dataset(
+            "parquet",
+            data_files={"train": parquet_files},
+            cache_dir=model_args.cache_dir,
+        )
+        
+        # Create validation split from training data
+        raw_datasets["validation"] = load_dataset(
+            "parquet",
+            data_files={"train": parquet_files},
+            split=f"train[:{data_args.validation_split_percentage}%]",
+            cache_dir=model_args.cache_dir,
+        )
+        raw_datasets["train"] = load_dataset(
+            "parquet",
+            data_files={"train": parquet_files},
+            split=f"train[{data_args.validation_split_percentage}%:]",
+            cache_dir=model_args.cache_dir,
+        )
     else:
         data_files = {}
         if data_args.train_file is not None:
@@ -704,7 +752,7 @@ def main():
         trust_remote_code=model_args.trust_remote_code,
         torch_dtype=torch_dtype,
         low_cpu_mem_usage=model_args.low_cpu_mem_usage,
-        attn_implementation=model_args.attn_implementation,
+        attn_implementation=model_args.attn_implementation
     )
 
     # model organization is MODEL_TYPEBiForMNTP.model -> MODEL_TYPELBiModel, we have to apply PEFT to the inner model

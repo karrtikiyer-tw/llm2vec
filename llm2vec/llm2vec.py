@@ -18,6 +18,7 @@ from transformers import (
     LlamaConfig,
     MistralConfig,
     GemmaConfig,
+    Gemma2Config,
     Qwen2Config,
 )
 
@@ -25,6 +26,7 @@ from .models import (
     MistralBiModel,
     LlamaBiModel,
     GemmaBiModel,
+    Gemma2BiModel,
     Qwen2BiModel,
 )
 
@@ -70,6 +72,8 @@ class LLM2Vec(nn.Module):
             return LlamaBiModel
         elif config_class_name == "GemmaConfig":
             return GemmaBiModel
+        elif config_class_name == "Gemma2Config":  
+            return Gemma2BiModel
         elif config_class_name == "Qwen2Config":
             return Qwen2BiModel
         else:
@@ -173,7 +177,7 @@ class LLM2Vec(nn.Module):
                 self.model.config, MistralConfig
             ):
                 text = text.strip() + " </s>"
-            elif isinstance(self.model.config, GemmaConfig):
+            elif isinstance(self.model.config, GemmaConfig) or isinstance(self.model.config, Gemma2Config):
                 text = text.strip() + "<eos>"
             elif isinstance(self.model.config, Qwen2Config):
                 text = text.strip() + "<|endoftext|>"
